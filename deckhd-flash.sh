@@ -65,17 +65,19 @@ preflight() {
     done
 
     if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
-        warn "Missing packages: ${MISSING_PKGS[*]}"
-        warn "Temporarily disabling SteamOS read-only filesystem..."
-        sudo steamos-readonly disable
-
-        info "Installing missing packages via pacman..."
-        sudo pacman -Sy --noconfirm "${MISSING_PKGS[@]}"
-
-        info "Re-enabling SteamOS read-only filesystem..."
-        sudo steamos-readonly enable
+        # These tools all ship with SteamOS desktop mode by default.
+        # Rather than touching the filesystem or keyring, just tell the
+        # user what is missing and let them handle it safely themselves.
+        echo ""
+        die "The following required tools are missing: ${MISSING_PKGS[*]}\n\n" \
+            "On a stock SteamOS these should already be present.\n" \
+            "If you recently ran a system update, try rebooting first.\n" \
+            "To install manually (in Desktop Mode):\n" \
+            "  sudo steamos-readonly disable\n" \
+            "  sudo pacman -Sy ${MISSING_PKGS[*]}\n" \
+            "  sudo steamos-readonly enable"
     else
-        info "All pacman dependencies already present."
+        info "All dependencies present."
     fi
 
     # ── Rust/cargo — needed to build uninsyde ─────────────────────────────────
