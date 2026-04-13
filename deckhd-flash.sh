@@ -140,16 +140,7 @@ PATTERNS = {
         "e0 90 03 56 20 e6 04 74 01 f0 22 74 02 f0 22",
         "EC display_id byte (patcher.cpp offset +0x21)"
     ),
-    "edid": (
-        "00 ff ff ff ff ff ff 00 59 96 01 30 01 00 00 00 1e 1c 01 04 "
-        "a5 0a 0f 78 16 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 "
-        "01 00 01 00 01 00 01 00 01 00 01 00 01 00 0f 1b 20 48 30 00 "
-        "2c 50 20 14 02 04 3c 3c 00 00 00 1e 00 00 00 fc 00 41 4e 58 "
-        "37 35 33 30 20 55 0a 20 20 20 00 00 00 10 00 00 00 00 00 00 "
-        "00 00 00 00 00 00 00 00 00 00 00 00 10 00 00 00 00 00 00 00 "
-        "00 00 00 00 00 00 00 00 93",
-        "Original ANX7530 EDID (128 bytes)"
-    ),
+    # edid is located dynamically at runtime (see patch_ec) — not pattern-matched here
     "mipi_port_cmds": (
         "aa 00 00 00 64 6c 00 00 e0 15 6c 00 93 e1 15 6c 00 65 e2 15 "
         "6c 00 f8 e3 15 6c 00 03 80 15 6c 00 01 e0 15 6c 00 00 00 15 "
@@ -179,21 +170,16 @@ print(f"\n{BOLD}[2/4] Validating patterns in BIOS image{NC}")
 ec1 = bios[EC1_OFFSET : EC1_OFFSET + EC_LEN]
 ec2 = bios[EC2_OFFSET : EC2_OFFSET + EC_LEN]
 
-found = {}  # name -> (ec_block_name, absolute_offset_in_bios)
-
 for name, (pattern, desc) in PATTERNS.items():
     if name == "bios_version":
-        # Searched in full bios, not EC blocks
         pos = find_pattern(bios, pattern)
         if pos == -1:
             fail(f"{name}: NOT found in BIOS — {desc}")
             errors.append(f"Pattern '{name}' not found")
         else:
             ok(f"{name} at 0x{pos:08X} (full BIOS) — {desc}")
-            found[name] = ("bios", pos)
         continue
 
-    # Search in EC1
     pos1 = find_pattern(ec1, pattern)
     pos2 = find_pattern(ec2, pattern)
 
@@ -203,10 +189,53 @@ for name, (pattern, desc) in PATTERNS.items():
     else:
         if pos1 != -1:
             ok(f"{name} in EC1 at 0x{EC1_OFFSET + pos1:08X} — {desc}")
-            found[f"{name}_ec1"] = pos1
         if pos2 != -1:
             ok(f"{name} in EC2 at 0x{EC2_OFFSET + pos2:08X} — {desc}")
-            found[f"{name}_ec2"] = pos2
+
+# ── Dynamically locate and validate the EDID in EC1 ──────────────────────────
+# Instead of matching a hardcoded 128-byte blob (which varies per BIOS revision),
+# we find the EDID by its standard header and verify it's an ANX7530 (Analogix, 59 96).
+EDID_HEADER  = bytes([0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00])
+ANX_MFR      = bytes([0x59, 0x96])   # Analogix manufacturer ID
+EDID_LEN     = 128
+
+edid_pos_ec1 = -1
+search_from  = 0
+while True:
+    pos = ec1.find(EDID_HEADER, search_from)
+    if pos == -1:
+        break
+    if ec1[pos+8:pos+10] == ANX_MFR:
+        edid_pos_ec1 = pos
+        break
+    search_from = pos + 1
+
+if edid_pos_ec1 == -1:
+    fail("ANX7530 EDID (manufacturer 59 96) not found in EC1!")
+    errors.append("Original EDID not found in EC1")
+else:
+    orig_edid = bytes(ec1[edid_pos_ec1 : edid_pos_ec1 + EDID_LEN])
+    ok(f"Original EDID found in EC1 at 0x{EC1_OFFSET + edid_pos_ec1:08X}")
+    info(f"  Mfr: {orig_edid[8]:02X}{orig_edid[9]:02X}  "
+         f"Product: {orig_edid[10]:02X}{orig_edid[11]:02X}  "
+         f"Checksum byte: {orig_edid[127]:02X}")
+
+# Also locate in EC2
+edid_pos_ec2 = -1
+search_from  = 0
+while True:
+    pos = ec2.find(EDID_HEADER, search_from)
+    if pos == -1:
+        break
+    if ec2[pos+8:pos+10] == ANX_MFR:
+        edid_pos_ec2 = pos
+        break
+    search_from = pos + 1
+
+if edid_pos_ec2 != -1:
+    ok(f"Original EDID found in EC2 at 0x{EC2_OFFSET + edid_pos_ec2:08X}")
+else:
+    info("EDID not found in EC2 (may be normal for some BIOS versions)")
 
 # Validate edid.bin
 print(f"\n{BOLD}[3/4] Validating edid.bin{NC}")
@@ -218,8 +247,11 @@ if len(new_edid) != 128:
     errors.append("edid.bin wrong size")
 else:
     ok(f"edid.bin is 128 bytes")
-    info(f"DeckHD EDID mfr : {new_edid[8]:02X}{new_edid[9]:02X} "
-         f"product {new_edid[10]:02X}{new_edid[11]:02X}")
+    info(f"  DeckHD EDID mfr: {new_edid[8]:02X}{new_edid[9]:02X}  "
+         f"Product: {new_edid[10]:02X}{new_edid[11]:02X}  "
+         f"Checksum byte: {new_edid[127]:02X}")
+    if edid_pos_ec1 != -1 and orig_edid == new_edid:
+        info("  Note: EDID already matches DeckHD edid.bin — may already be patched")
 
 # ── Summary / apply ───────────────────────────────────────────────────────────
 print(f"\n{BOLD}[4/4] {'Dry-run summary' if dry_run else 'Applying patches'}{NC}")
@@ -245,11 +277,25 @@ def patch_ec(ec, label):
         ec[pos + 0x21] = 1
         ok(f"{label}: display_id patched at 0x{pos+0x21:04X}")
 
-    # 2. EDID: replace 128 bytes at pattern offset
-    pos = find_pattern(ec, PATTERNS["edid"][0])
-    if pos != -1:
-        ec[pos : pos + 128] = new_edid
-        ok(f"{label}: EDID replaced at 0x{pos:04X}")
+    # 2. EDID: locate dynamically by EDID header + ANX7530 manufacturer ID (59 96)
+    # This works regardless of BIOS version since the manufacturer ID is stable.
+    EDID_HEADER = bytes([0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00])
+    ANX_MFR     = bytes([0x59, 0x96])
+    edid_pos    = -1
+    search_from = 0
+    while True:
+        pos = ec.find(EDID_HEADER, search_from)
+        if pos == -1:
+            break
+        if ec[pos+8:pos+10] == ANX_MFR:
+            edid_pos = pos
+            break
+        search_from = pos + 1
+    if edid_pos != -1:
+        ec[edid_pos : edid_pos + 128] = new_edid
+        ok(f"{label}: EDID replaced at 0x{edid_pos:04X} (detected via ANX7530 mfr ID)")
+    else:
+        ok(f"{label}: EDID not found — skipping (may be normal for this EC block)")
 
     # 3. MIPI port commands: replace with DeckHD inits
     # New MIPI init table (from patcher.cpp inits[] struct, little-endian packed)
