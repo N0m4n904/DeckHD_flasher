@@ -7,6 +7,8 @@
 #   ./deckhd-flash.sh --dry-run    — validate only, no writes, no flashing
 #
 # Only requires: git, python3, zenity — all stock on SteamOS. No pacman needed.
+# Uses Zig (downloaded as single binary to ~/. deckhd-patcher) to compile
+# patcher.cpp — no system gcc/g++ required.
 # Run from Desktop Mode on your Steam Deck.
 # =============================================================================
 
@@ -24,11 +26,12 @@ section() { echo -e "\n${CYAN}${BOLD}── $* ${NC}"; }
 
 WORKDIR="$HOME/.deckhd-patcher"
 BIOSMAKER_DIR="$WORKDIR/BiosMaker"
+ZIG_DIR="$WORKDIR/zig"
 ORIGINAL_FD=$(ls /usr/share/jupiter_bios/F7A*_sign.fd 2>/dev/null | head -n1)
 BACKUP_FD="$WORKDIR/original_backup.fd"
-PATCHED_BIN="$WORKDIR/bios_DeckHD.bin"
 PATCHED_FD="$WORKDIR/deckhd_patched.fd"
 
+# ── Preflight ─────────────────────────────────────────────────────────────────
 preflight() {
     section "Preflight checks"
     [[ -f /usr/share/jupiter_bios_updater/h2offt ]] \
@@ -37,15 +40,16 @@ preflight() {
         || die "No F7A*_sign.fd found in /usr/share/jupiter_bios/. Is SteamOS up to date?"
     info "Found BIOS file : $ORIGINAL_FD"
     info "BIOS version    : $(cat /sys/class/dmi/id/bios_version 2>/dev/null || echo 'unknown')"
-    for cmd in git python3 zenity; do
+    for cmd in git python3 zenity curl tar; do
         command -v "$cmd" &>/dev/null \
             || die "'$cmd' is missing. Try rebooting — it should be present on stock SteamOS."
     done
-    info "Dependencies OK : git, python3, zenity"
+    info "Dependencies OK : git, python3, zenity, curl, tar"
     $DRY_RUN && warn "DRY-RUN MODE — no files will be written, nothing will be flashed."
     mkdir -p "$WORKDIR"
 }
 
+# ── Clone BiosMaker ───────────────────────────────────────────────────────────
 clone_biosmaker() {
     section "Fetching DeckHD/BiosMaker"
     if [[ -d "$BIOSMAKER_DIR/.git" ]]; then
@@ -54,10 +58,62 @@ clone_biosmaker() {
         git clone --quiet https://github.com/DeckHD/BiosMaker.git "$BIOSMAKER_DIR"
         info "BiosMaker cloned."
     fi
-    [[ -f "$BIOSMAKER_DIR/edid.bin" ]] || die "edid.bin not found in BiosMaker repo."
-    info "edid.bin present."
+    [[ -f "$BIOSMAKER_DIR/edid.bin" ]]    || die "edid.bin not found in BiosMaker repo."
+    [[ -f "$BIOSMAKER_DIR/uninsyde" ]]    || die "uninsyde binary not found in BiosMaker repo."
+    [[ -f "$BIOSMAKER_DIR/UEFIReplace" ]] || die "UEFIReplace binary not found in BiosMaker repo."
+    [[ -f "$BIOSMAKER_DIR/patcher.cpp" ]] || die "patcher.cpp not found in BiosMaker repo."
+    chmod +x "$BIOSMAKER_DIR/uninsyde" "$BIOSMAKER_DIR/UEFIReplace"
+    info "BiosMaker ready (uninsyde, UEFIReplace, patcher.cpp, edid.bin present)."
 }
 
+# ── Install Zig (user-local, no sudo, no pacman) ──────────────────────────────
+# Zig bundles its own C++ compiler — no system gcc needed.
+install_zig() {
+    section "Checking C++ compiler (Zig)"
+
+    if [[ -x "$ZIG_DIR/zig" ]]; then
+        info "Zig already present: $("$ZIG_DIR/zig" version)"
+        return
+    fi
+
+    info "Downloading Zig (single binary, no sudo needed)..."
+    # Zig 0.13.0 for x86_64-linux
+    ZIG_VERSION="0.13.0"
+    ZIG_TARBALL="zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}"
+
+    curl -L --progress-bar "$ZIG_URL" -o "$WORKDIR/$ZIG_TARBALL"
+    mkdir -p "$ZIG_DIR"
+    tar -xf "$WORKDIR/$ZIG_TARBALL" -C "$ZIG_DIR" --strip-components=1
+    rm "$WORKDIR/$ZIG_TARBALL"
+
+    [[ -x "$ZIG_DIR/zig" ]] || die "Zig extraction failed."
+    info "Zig installed: $("$ZIG_DIR/zig" version)"
+}
+
+# ── Compile patcher.cpp via Zig ───────────────────────────────────────────────
+compile_patcher() {
+    section "Compiling patcher.cpp"
+
+    if [[ -x "$BIOSMAKER_DIR/patcher" ]]; then
+        info "patcher binary already compiled, skipping."
+        return
+    fi
+
+    info "Compiling patcher.cpp with Zig c++ frontend..."
+    # Zig can compile C/C++ directly: zig c++ <flags>
+    "$ZIG_DIR/zig" c++ \
+        -O2 \
+        -o "$BIOSMAKER_DIR/patcher" \
+        "$BIOSMAKER_DIR/patcher.cpp" \
+        -I "$BIOSMAKER_DIR" \
+        -lc
+
+    [[ -x "$BIOSMAKER_DIR/patcher" ]] || die "patcher compilation failed."
+    info "patcher compiled successfully."
+}
+
+# ── Backup ────────────────────────────────────────────────────────────────────
 backup_bios() {
     section "Backup"
     if $DRY_RUN; then
@@ -72,354 +128,104 @@ backup_bios() {
     cp "$ORIGINAL_FD" "$BACKUP_FD"
 }
 
-patch_bios() {
-    section "Patch validation & application"
+# ── Run biosmaker.sh (the real thing) ─────────────────────────────────────────
+run_biosmaker() {
+    section "Running biosmaker.sh"
 
-    python3 - "$BACKUP_FD" "$BIOSMAKER_DIR/edid.bin" "$PATCHED_BIN" "$DRY_RUN" << 'PYEOF'
+    # biosmaker.sh must run from its own directory (uses relative paths)
+    pushd "$BIOSMAKER_DIR" > /dev/null
+
+    # It calls g++ internally — override with our Zig wrapper
+    # Create a local g++ shim that redirects to zig c++
+    mkdir -p "$BIOSMAKER_DIR/bin"
+    cat > "$BIOSMAKER_DIR/bin/g++" << SHIMEOF
+#!/bin/bash
+exec "$ZIG_DIR/zig" c++ "\$@"
+SHIMEOF
+    chmod +x "$BIOSMAKER_DIR/bin/g++"
+    export PATH="$BIOSMAKER_DIR/bin:$PATH"
+
+    info "Running: biosmaker.sh $BACKUP_FD"
+    bash biosmaker.sh "$BACKUP_FD"
+
+    popd > /dev/null
+
+    # biosmaker outputs F7A<version>_DeckHD.bin in its working dir
+    BIOSVER=$(basename "$ORIGINAL_FD" | sed 's/_sign\.fd//')
+    PATCHED_BIN="$BIOSMAKER_DIR/${BIOSVER}_DeckHD.bin"
+
+    [[ -f "$PATCHED_BIN" ]] \
+        || die "biosmaker.sh ran but ${BIOSVER}_DeckHD.bin not found. Check output above."
+
+    info "Patched binary produced: $PATCHED_BIN"
+}
+
+# ── Validate patched .bin ─────────────────────────────────────────────────────
+validate() {
+    section "Validating patched .bin"
+
+    python3 - "$PATCHED_BIN" "$DRY_RUN" << 'PYEOF'
 import sys, struct, hashlib
 
-fd_path   = sys.argv[1]
-edid_path = sys.argv[2]
-out_path  = sys.argv[3]
-dry_run   = sys.argv[4].lower() == "true"
+bin_path = sys.argv[1]
+dry_run  = sys.argv[2].lower() == "true"
 
-BOLD="\033[1m"; GREEN="\033[0;32m"; RED="\033[0;31m"
-CYAN="\033[0;36m"; YELL="\033[1;33m"; NC="\033[0m"
+GREEN="\033[0;32m"; RED="\033[0;31m"; CYAN="\033[0;36m"
+YELL="\033[1;33m"; BOLD="\033[1m"; NC="\033[0m"
 
 def ok(m):   print(f"  {GREEN}✓{NC} {m}")
 def fail(m): print(f"  {RED}✗{NC} {m}", file=sys.stderr)
 def info(m): print(f"  {CYAN}·{NC} {m}")
 
+with open(bin_path, 'rb') as f:
+    bios = f.read()
+
 errors = []
 
-def find_pattern(data, pattern_hex):
-    """Find a hex pattern in data, supporting '??' wildcards."""
-    pattern_hex = pattern_hex.replace(' ', '')
-    pat_bytes = []
-    for i in range(0, len(pattern_hex), 2):
-        chunk = pattern_hex[i:i+2]
-        pat_bytes.append(None if chunk == '??' else int(chunk, 16))
-    plen = len(pat_bytes)
-    for i in range(len(data) - plen + 1):
-        if all(pb is None or data[i+j] == pb for j, pb in enumerate(pat_bytes)):
-            return i
-    return -1
-
-# ── Load .fd and extract BIOS payload ────────────────────────────────────────
-print(f"\n{BOLD}[1/4] Inspecting BIOS capsule{NC}")
-
-with open(fd_path, 'rb') as f:
-    fd_data = f.read()
-
-IFLASH_MARKER = b'$_IFLASH_BIOSIMG'
-marker_pos = fd_data.find(IFLASH_MARKER)
-if marker_pos == -1:
-    fail("$_IFLASH_BIOSIMG marker not found!")
-    sys.exit(1)
-
-payload_size  = struct.unpack_from('<I', fd_data, marker_pos + 20)[0]
-payload_start = marker_pos + 24
-bios = bytearray(fd_data[payload_start : payload_start + payload_size])
-
-ok(f".fd capsule parsed — marker at 0x{marker_pos:08X}")
-info(f"BIOS payload size   : {len(bios):,} bytes ({len(bios)/1024/1024:.2f} MB)")
-info(f"BIOS SHA256 (orig)  : {hashlib.sha256(bios).hexdigest()[:24]}...")
-
-# The patcher works on two EC firmware blocks embedded in the BIOS:
-#   EC1 at offset 0x000000, length 0x20000
-#   EC2 at offset 0x040000, length 0x20000
-EC1_OFFSET = 0x000000
-EC2_OFFSET = 0x040000
-EC_LEN     = 0x020000
-
-# ── Patterns (taken verbatim from patcher.cpp FindPattern calls) ──────────────
-# Each is (name, hex_pattern, description)
-PATTERNS = {
-    "display_id": (
-        "e0 70 09 90 16 01 e0 44 20 f0 80 06 90 16 15 74 80 f0 90 16 0a "
-        "e0 90 03 56 20 e6 04 74 01 f0 22 74 02 f0 22",
-        "EC display_id byte (patcher.cpp offset +0x21)"
-    ),
-    # edid is located dynamically at runtime (see patch_ec) — not pattern-matched here
-    "mipi_port_cmds": (
-        "aa 00 00 00 64 6c 00 00 e0 15 6c 00 93 e1 15 6c 00 65 e2 15 "
-        "6c 00 f8 e3 15 6c 00 03 80 15 6c 00 01 e0 15 6c 00 00 00 15 "
-        "6c 00 8c 01 15 6c 00 00 03 15 6c 00 a8 04 15",
-        "MIPI port init command table"
-    ),
-    "pdcp_cmds": (
-        "10 01 06 10 02 82 11 00 06 11 01 82 11 03 01 "
-        "11 04 01 11 05 01 11 06 01 ff ff ff",
-        "PDCP/DPCD init command table"
-    ),
-    "spi_cmds": (
-        "a0 20 a1 03 a2 20 a3 00 a4 14 a5 00 a6 14 a7 00 "
-        "a8 00 a9 05 aa 10 ab 00 ac 02 ad 00 ae 1a af 00 "
-        "9d 3c b0 0c b1 48 9f 7b 9e c0 ff ff",
-        "SPI init command table (timing/resolution registers)"
-    ),
-    "bios_version": (
-        "24 42 56 44 54 24",
-        "BIOS version string marker ($BVDT$)"
-    ),
-}
-
-# ── Validate all patterns in both EC blocks ───────────────────────────────────
-print(f"\n{BOLD}[2/4] Validating patterns in BIOS image{NC}")
-
-ec1 = bios[EC1_OFFSET : EC1_OFFSET + EC_LEN]
-ec2 = bios[EC2_OFFSET : EC2_OFFSET + EC_LEN]
-
-for name, (pattern, desc) in PATTERNS.items():
-    if name == "bios_version":
-        pos = find_pattern(bios, pattern)
-        if pos == -1:
-            fail(f"{name}: NOT found in BIOS — {desc}")
-            errors.append(f"Pattern '{name}' not found")
-        else:
-            ok(f"{name} at 0x{pos:08X} (full BIOS) — {desc}")
-        continue
-
-    pos1 = find_pattern(ec1, pattern)
-    pos2 = find_pattern(ec2, pattern)
-
-    if pos1 == -1 and pos2 == -1:
-        fail(f"{name}: NOT found in EC1 or EC2 — {desc}")
-        errors.append(f"Pattern '{name}' not found in any EC block")
-    else:
-        if pos1 != -1:
-            ok(f"{name} in EC1 at 0x{EC1_OFFSET + pos1:08X} — {desc}")
-        if pos2 != -1:
-            ok(f"{name} in EC2 at 0x{EC2_OFFSET + pos2:08X} — {desc}")
-
-# ── Dynamically locate and validate the EDID in EC1 ──────────────────────────
-# Instead of matching a hardcoded 128-byte blob (which varies per BIOS revision),
-# we find the EDID by its standard header and verify it's an ANX7530 (Analogix, 59 96).
-EDID_HEADER  = bytes([0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00])
-ANX_MFR      = bytes([0x59, 0x96])   # Analogix manufacturer ID
-EDID_LEN     = 128
-
-edid_pos_ec1 = -1
-search_from  = 0
-while True:
-    pos = ec1.find(EDID_HEADER, search_from)
-    if pos == -1:
-        break
-    if ec1[pos+8:pos+10] == ANX_MFR:
-        edid_pos_ec1 = pos
-        break
-    search_from = pos + 1
-
-if edid_pos_ec1 == -1:
-    fail("ANX7530 EDID (manufacturer 59 96) not found in EC1!")
-    errors.append("Original EDID not found in EC1")
+# Check file size (should be 16MB)
+if len(bios) != 0x1000000:
+    fail(f"Unexpected size: {len(bios):,} bytes (expected 16,777,216)")
+    errors.append("wrong size")
 else:
-    orig_edid = bytes(ec1[edid_pos_ec1 : edid_pos_ec1 + EDID_LEN])
-    ok(f"Original EDID found in EC1 at 0x{EC1_OFFSET + edid_pos_ec1:08X}")
-    info(f"  Mfr: {orig_edid[8]:02X}{orig_edid[9]:02X}  "
-         f"Product: {orig_edid[10]:02X}{orig_edid[11]:02X}  "
-         f"Checksum byte: {orig_edid[127]:02X}")
+    ok(f"File size correct: {len(bios):,} bytes (16 MB)")
 
-# Also locate in EC2
-edid_pos_ec2 = -1
-search_from  = 0
-while True:
-    pos = ec2.find(EDID_HEADER, search_from)
-    if pos == -1:
-        break
-    if ec2[pos+8:pos+10] == ANX_MFR:
-        edid_pos_ec2 = pos
-        break
-    search_from = pos + 1
-
-if edid_pos_ec2 != -1:
-    ok(f"Original EDID found in EC2 at 0x{EC2_OFFSET + edid_pos_ec2:08X}")
+# Check DeckHD version string is present
+if b' DeckHD' in bios:
+    ok("'DeckHD' version string found in patched BIOS")
 else:
-    info("EDID not found in EC2 (may be normal for some BIOS versions)")
+    fail("' DeckHD' version string NOT found — patcher may have failed")
+    errors.append("DeckHD version string missing")
 
-# Validate edid.bin
-print(f"\n{BOLD}[3/4] Validating edid.bin{NC}")
-with open(edid_path, 'rb') as f:
-    new_edid = f.read()
-
-if len(new_edid) != 128:
-    fail(f"edid.bin is {len(new_edid)} bytes — expected 128!")
-    errors.append("edid.bin wrong size")
+# Check DeckHD EDID manufacturer (11 04 = DeckHD panel)
+# The new edid.bin has mfr 11 04 product 01 40
+DECKHD_EDID_MFR = bytes([0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x11,0x04])
+if DECKHD_EDID_MFR in bios:
+    ok("DeckHD EDID (mfr 1104) found in patched BIOS")
 else:
-    ok(f"edid.bin is 128 bytes")
-    info(f"  DeckHD EDID mfr: {new_edid[8]:02X}{new_edid[9]:02X}  "
-         f"Product: {new_edid[10]:02X}{new_edid[11]:02X}  "
-         f"Checksum byte: {new_edid[127]:02X}")
-    if edid_pos_ec1 != -1 and orig_edid == new_edid:
-        info("  Note: EDID already matches DeckHD edid.bin — may already be patched")
+    fail("DeckHD EDID not found in patched BIOS")
+    errors.append("DeckHD EDID missing")
 
-# ── Summary / apply ───────────────────────────────────────────────────────────
-print(f"\n{BOLD}[4/4] {'Dry-run summary' if dry_run else 'Applying patches'}{NC}")
+info(f"SHA256: {hashlib.sha256(bios).hexdigest()[:32]}...")
 
 if errors:
     print(f"\n  {RED}{BOLD}VALIDATION FAILED — {len(errors)} issue(s):{NC}")
     for e in errors: fail(e)
-    print(f"\n  Do NOT flash until these are resolved.\n")
+    print(f"\n  Do NOT flash.\n")
     sys.exit(1)
 
 if dry_run:
-    print(f"\n  {GREEN}{BOLD}✓ All validations passed! ({len(PATTERNS)} patterns found){NC}")
-    print(f"  {YELL}Dry-run complete — no files were written.{NC}")
-    print(f"\n  Run without --dry-run to patch and flash.\n")
+    print(f"\n  {GREEN}{BOLD}✓ Dry-run validation passed!{NC}")
+    print(f"  {YELL}Run without --dry-run to patch and flash.{NC}\n")
     sys.exit(0)
 
-# ── Apply patches ─────────────────────────────────────────────────────────────
-def patch_ec(ec, label):
-    """Apply all EC patches to a single EC block (bytearray)."""
-    # 1. display_id: set byte at pattern+0x21 to 1
-    pos = find_pattern(ec, PATTERNS["display_id"][0])
-    if pos != -1:
-        ec[pos + 0x21] = 1
-        ok(f"{label}: display_id patched at 0x{pos+0x21:04X}")
-
-    # 2. EDID: locate dynamically by EDID header + ANX7530 manufacturer ID (59 96)
-    # This works regardless of BIOS version since the manufacturer ID is stable.
-    EDID_HEADER = bytes([0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00])
-    ANX_MFR     = bytes([0x59, 0x96])
-    edid_pos    = -1
-    search_from = 0
-    while True:
-        pos = ec.find(EDID_HEADER, search_from)
-        if pos == -1:
-            break
-        if ec[pos+8:pos+10] == ANX_MFR:
-            edid_pos = pos
-            break
-        search_from = pos + 1
-    if edid_pos != -1:
-        ec[edid_pos : edid_pos + 128] = new_edid
-        ok(f"{label}: EDID replaced at 0x{edid_pos:04X} (detected via ANX7530 mfr ID)")
-    else:
-        ok(f"{label}: EDID not found — skipping (may be normal for this EC block)")
-
-    # 3. MIPI port commands: replace with DeckHD inits
-    # New MIPI init table (from patcher.cpp inits[] struct, little-endian packed)
-    # Format: ANX_MIPI_PORT_CMD { uint8_t offset; uint32_t value; } = 5 bytes each
-    # Values from patcher.cpp inits[]:
-    mipi_new = bytes([
-        0x00, 0xe8, 0x03, 0x00, 0x00,  # DELAY 1000ms
-        0x6c, 0x15, 0xff, 0x51, 0x00,  # set_display_brightness 0xff
-        0x6c, 0x15, 0x2c, 0x53, 0x00,  # write_control_display 0x2c
-        0x6c, 0x15, 0x00, 0x55, 0x00,  # write_power_save 0x00
-        0x6c, 0x05, 0x00, 0x11, 0x00,  # exit_sleep_mode
-        0x00, 0x50, 0x00, 0x00, 0x00,  # DELAY 80ms
-        0x6c, 0x05, 0x00, 0x29, 0x00,  # set_display_on
-        0x00, 0x14, 0x00, 0x00, 0x00,  # DELAY 20ms
-        0x6c, 0x15, 0x00, 0x35, 0x00,  # set_tear_on
-        0xff, 0x00, 0x00, 0x00, 0x00,  # END
-    ])
-    pos = find_pattern(ec, PATTERNS["mipi_port_cmds"][0])
-    if pos != -1:
-        ec[pos : pos + len(mipi_new)] = mipi_new
-        ok(f"{label}: MIPI port cmds patched at 0x{pos:04X}")
-
-    # 4. PDCP commands: replace with DeckHD pdcp_init[]
-    # ANX_SLAVE_CMD { uint8_t slave_id, offset, value } = 3 bytes each
-    pdcp_new = bytes([
-        0x10, 0x01, 0x0f,  # SLAVEID_DPCD, MAX_LINK_RATE, 0x0f
-        0x10, 0x02, 0x82,  # SLAVEID_DPCD, MAX_LANE_COUNT, 0x82
-        0x11, 0x00, 0x06,
-        0x11, 0x01, 0x82,
-        0x11, 0x03, 0x01,
-        0x11, 0x04, 0x01,
-        0x11, 0x05, 0x01,
-        0x11, 0x06, 0x01,
-        0xff, 0xff, 0xff,  # END
-    ])
-    pos = find_pattern(ec, PATTERNS["pdcp_cmds"][0])
-    if pos != -1:
-        ec[pos : pos + len(pdcp_new)] = pdcp_new
-        ok(f"{label}: PDCP cmds patched at 0x{pos:04X}")
-
-    # 5. SPI commands: replace with DeckHD spi_init[] for 1920x1200
-    # ANX_SPI_CMD { uint8_t offset, value } = 2 bytes each
-    # SW_H_ACTIVE=1200 (0x04B0), SW_V_ACTIVE=1920 (0x0780)
-    # SW_HFP=40, SW_HSYNC=20, SW_HBP=40
-    # SW_VFP=18, SW_VSYNC=2, SW_VBP=20
-    spi_new = bytes([
-        0xa0, 0xb0,  # SW_H_ACTIVE_L  (1200 & 0xff = 0xB0)
-        0xa1, 0x04,  # SW_H_ACTIVE_H  (1200 >> 8   = 0x04)
-        0xa2, 0x28,  # SW_HFP_L       (40 = 0x28)
-        0xa3, 0x00,  # SW_HFP_H
-        0xa4, 0x14,  # SW_HSYNC_L     (20 = 0x14)
-        0xa5, 0x00,  # SW_HSYNC_H
-        0xa6, 0x28,  # SW_HBP_L       (40 = 0x28)
-        0xa7, 0x00,  # SW_HBP_H
-        0xa8, 0x80,  # SW_V_ACTIVE_L  (1920 & 0xff = 0x80)
-        0xa9, 0x07,  # SW_V_ACTIVE_H  (1920 >> 8   = 0x07)
-        0xaa, 0x12,  # SW_VFP_L       (18 = 0x12)
-        0xab, 0x00,  # SW_VFP_H
-        0xac, 0x02,  # SW_VSYNC_L     (2)
-        0xad, 0x00,  # SW_VSYNC_H
-        0xae, 0x14,  # SW_VBP_L       (20 = 0x14)
-        0xaf, 0x00,  # SW_VBP_H
-        0x9d, 0x3c,  # SW_PANEL_FRAME_RATE = 60
-        0xb0, 0x0c,  # SW_PANEL_INFO_0: 3 lanes
-        0xb1, 0x48,  # SW_PANEL_INFO_1: DSC_NO_DSC | BURST
-        0x9f, 0x7b,  # MISC_NOTIFY_OCM1
-        0x9e, 0xc0,  # MISC_NOTIFY_OCM0: MCU_LOAD_DONE | PANEL_INFO_SET_DONE
-        0xff, 0xff,  # END
-    ])
-    pos = find_pattern(ec, PATTERNS["spi_cmds"][0])
-    if pos != -1:
-        ec[pos : pos + len(spi_new)] = spi_new
-        ok(f"{label}: SPI cmds patched at 0x{pos:04X}")
-
-    # 6. Recalculate EC checksum (sum of bytes 0x2000..0x1F7FE, stored big-endian at 0x1F7FE)
-    checksum = sum(ec[0x2000:0x1f7fe]) & 0xffff
-    ec[0x1f7fe] = (checksum >> 8) & 0xff
-    ec[0x1f7ff] = checksum & 0xff
-    ok(f"{label}: checksum recalculated = 0x{checksum:04X}")
-
-# Patch EC1 and EC2
-ec1 = bytearray(bios[EC1_OFFSET : EC1_OFFSET + EC_LEN])
-ec2 = bytearray(bios[EC2_OFFSET : EC2_OFFSET + EC_LEN])
-patch_ec(ec1, "EC1")
-patch_ec(ec2, "EC2")
-bios[EC1_OFFSET : EC1_OFFSET + EC_LEN] = ec1
-bios[EC2_OFFSET : EC2_OFFSET + EC_LEN] = ec2
-
-# 7. Patch BIOS version string: append " DeckHD" after $BVDT$ marker (twice)
-marker_pat = PATTERNS["bios_version"][0]
-search_from = 0
-patched_ver = 0
-for _ in range(2):
-    pos = find_pattern(bios[search_from:], marker_pat)
-    if pos == -1:
-        break
-    pos += search_from
-    # Walk forward to the version string (past the marker + 22 bytes per patcher.cpp offset)
-    ver_pos = pos + 22
-    # Find end of version string (null terminator)
-    while bios[ver_pos] != 0:
-        ver_pos += 1
-    # Overwrite last 7 chars before null with " DeckHD"
-    bios[ver_pos - 1 : ver_pos - 1 + 7] = b' DeckHD'
-    ok(f"BIOS version string patched at 0x{ver_pos:08X}")
-    patched_ver += 1
-    search_from = ver_pos + 1
-
-if patched_ver < 2:
-    info(f"Warning: only found {patched_ver}/2 version strings")
-
-# Write output
-with open(out_path, 'wb') as f:
-    f.write(bios)
-
-info(f"Patched BIOS SHA256 : {hashlib.sha256(bios).hexdigest()[:24]}...")
-print(f"\n  {GREEN}{BOLD}✓ All patches applied successfully.{NC}\n")
+print(f"\n  {GREEN}{BOLD}✓ Validation passed — ready to rebuild .fd{NC}\n")
 PYEOF
-
-    info "Patch step complete."
 }
 
+# ── Rebuild .fd capsule ───────────────────────────────────────────────────────
 rebuild_fd() {
     section "Rebuilding .fd capsule"
+
     if $DRY_RUN; then
         info "[dry-run] Would splice patched .bin back into .fd capsule."
         return
@@ -463,6 +269,7 @@ PYEOF
     info ".fd capsule rebuilt."
 }
 
+# ── Flash ─────────────────────────────────────────────────────────────────────
 flash_bios() {
     if $DRY_RUN; then
         section "Dry-run complete"
@@ -491,6 +298,7 @@ flash_bios() {
     info "Flash complete! Your Steam Deck will reboot."
 }
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 main() {
     echo ""
     echo -e "\033[0;36m\033[1m"
@@ -507,8 +315,11 @@ main() {
 
     preflight
     clone_biosmaker
+    install_zig
+    compile_patcher
     backup_bios
-    patch_bios
+    run_biosmaker
+    validate
     rebuild_fd
     flash_bios
 }
