@@ -28,7 +28,6 @@ WORKDIR="$HOME/.deckhd-patcher"
 BIOSMAKER_DIR="$WORKDIR/BiosMaker"
 ZIG_DIR="$WORKDIR/zig"
 ORIGINAL_FD=$(ls /usr/share/jupiter_bios/F7A*_sign.fd 2>/dev/null | head -n1)
-BACKUP_FD="$WORKDIR/original_backup.fd"
 PATCHED_FD="$WORKDIR/deckhd_patched.fd"
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
@@ -118,25 +117,32 @@ backup_bios() {
     section "Backup"
     if $DRY_RUN; then
         info "[dry-run] Would back up live BIOS to $WORKDIR/live_bios_backup.fd"
-        cp "$ORIGINAL_FD" "$BACKUP_FD"
         return
     fi
     info "Backing up live BIOS to $WORKDIR/live_bios_backup.fd ..."
     sudo /usr/share/jupiter_bios_updater/h2offt "$WORKDIR/live_bios_backup.fd" -O \
         && info "Live BIOS backup saved." \
         || warn "Live BIOS backup failed (non-fatal). Continuing..."
-    cp "$ORIGINAL_FD" "$BACKUP_FD"
 }
 
 # ── Run biosmaker.sh (the real thing) ─────────────────────────────────────────
 run_biosmaker() {
     section "Running biosmaker.sh"
 
+    # biosmaker.sh derives the output filename from the input basename:
+    #   input:  /path/to/F7A0133_sign.fd
+    #   output: F7A0133_DeckHD.bin  (in $BIOSMAKER_DIR)
+    # So we MUST pass ORIGINAL_FD directly, not a copy with a different name.
+    BIOSVER=$(basename "$ORIGINAL_FD" | sed 's/_sign\.fd//')
+    PATCHED_BIN="$BIOSMAKER_DIR/${BIOSVER}_DeckHD.bin"
+
+    # Remove stale output from a previous run so failure is reliably detected
+    rm -f "$PATCHED_BIN"
+
     # biosmaker.sh must run from its own directory (uses relative paths)
     pushd "$BIOSMAKER_DIR" > /dev/null
 
     # It calls g++ internally — override with our Zig wrapper
-    # Create a local g++ shim that redirects to zig c++
     mkdir -p "$BIOSMAKER_DIR/bin"
     cat > "$BIOSMAKER_DIR/bin/g++" << SHIMEOF
 #!/bin/bash
@@ -145,17 +151,13 @@ SHIMEOF
     chmod +x "$BIOSMAKER_DIR/bin/g++"
     export PATH="$BIOSMAKER_DIR/bin:$PATH"
 
-    info "Running: biosmaker.sh $BACKUP_FD"
-    bash biosmaker.sh "$BACKUP_FD"
+    info "Running: biosmaker.sh $ORIGINAL_FD"
+    bash biosmaker.sh "$ORIGINAL_FD"
 
     popd > /dev/null
 
-    # biosmaker outputs F7A<version>_DeckHD.bin in its working dir
-    BIOSVER=$(basename "$ORIGINAL_FD" | sed 's/_sign\.fd//')
-    PATCHED_BIN="$BIOSMAKER_DIR/${BIOSVER}_DeckHD.bin"
-
     [[ -f "$PATCHED_BIN" ]] \
-        || die "biosmaker.sh ran but ${BIOSVER}_DeckHD.bin not found. Check output above."
+        || die "biosmaker.sh ran but $PATCHED_BIN not found. Check output above."
 
     info "Patched binary produced: $PATCHED_BIN"
 }
@@ -231,7 +233,7 @@ rebuild_fd() {
         return
     fi
 
-    python3 - "$BACKUP_FD" "$PATCHED_BIN" "$PATCHED_FD" << 'PYEOF'
+    python3 - "$ORIGINAL_FD" "$PATCHED_BIN" "$PATCHED_FD" << 'PYEOF'
 import sys, struct
 
 fd_path  = sys.argv[1]
